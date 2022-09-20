@@ -17,16 +17,6 @@
 
 package kafka.log
 
-import java.io.{File, IOException}
-import java.lang.{Long => JLong}
-import java.nio.file.{Files, NoSuchFileException}
-import java.text.NumberFormat
-import java.util.Map.{Entry => JEntry}
-import java.util.Optional
-import java.util.concurrent.atomic._
-import java.util.concurrent.{ConcurrentNavigableMap, ConcurrentSkipListMap, TimeUnit}
-import java.util.regex.Pattern
-
 import com.yammer.metrics.core.Gauge
 import kafka.api.{ApiVersion, KAFKA_0_10_0_IV0}
 import kafka.common.{LogSegmentOffsetOverflowException, LongRef, OffsetsOutOfOrderException, UnexpectedAppendOffsetException}
@@ -34,7 +24,7 @@ import kafka.message.{BrokerCompressionCodec, CompressionCodec, NoCompressionCod
 import kafka.metrics.KafkaMetricsGroup
 import kafka.server.checkpoints.LeaderEpochCheckpointFile
 import kafka.server.epoch.LeaderEpochFileCache
-import kafka.server.{BrokerTopicStats, FetchDataInfo, FetchHighWatermark, FetchIsolation, FetchLogEnd, FetchTxnCommitted, LogDirFailureChannel, LogOffsetMetadata, OffsetAndEpoch}
+import kafka.server._
 import kafka.utils._
 import org.apache.kafka.common.errors._
 import org.apache.kafka.common.record.FileRecords.TimestampAndOffset
@@ -45,6 +35,15 @@ import org.apache.kafka.common.requests.{EpochEndOffset, ListOffsetRequest}
 import org.apache.kafka.common.utils.{Time, Utils}
 import org.apache.kafka.common.{InvalidRecordException, KafkaException, TopicPartition}
 
+import java.io.{File, IOException}
+import java.lang.{Long => JLong}
+import java.nio.file.{Files, NoSuchFileException}
+import java.text.NumberFormat
+import java.util.Map.{Entry => JEntry}
+import java.util.Optional
+import java.util.concurrent.atomic._
+import java.util.concurrent.{ConcurrentNavigableMap, ConcurrentSkipListMap, TimeUnit}
+import java.util.regex.Pattern
 import scala.collection.JavaConverters._
 import scala.collection.mutable.{ArrayBuffer, ListBuffer}
 import scala.collection.{Seq, Set, mutable}
@@ -291,15 +290,19 @@ class Log(@volatile var dir: File,
     val startMs = time.milliseconds
 
     // create the log directory if it doesn't exist
+    // 创建日志路径，保存Log对象磁盘文件
     Files.createDirectories(dir.toPath)
 
     initializeLeaderEpochCache()
 
+    // 加载所有日志段对象，并返回该Log对象下一条消息的位移值
     val nextOffset = loadSegments()
 
     /* Calculate the offset of the next message */
+    // 初始化LEO元数据对象，LEO值为上一步获取的位移值，起始位移值是Active Segment的起始位移
     nextOffsetMetadata = LogOffsetMetadata(nextOffset, activeSegment.baseOffset, activeSegment.size)
 
+    // 更新Leader Epoch缓存，去除LEO值之上的所有无效缓存项
     leaderEpochCache.foreach(_.truncateFromEnd(nextOffsetMetadata.messageOffset))
 
     updateLogStartOffset(math.max(logStartOffset, segments.firstEntry.getValue.baseOffset))
@@ -317,6 +320,7 @@ class Log(@volatile var dir: File,
       s"log end offset $logEndOffset in ${time.milliseconds() - startMs} ms")
   }
 
+  //  读取高水位的位移值
   def highWatermark: Long = highWatermarkMetadata.messageOffset
 
   /**
@@ -330,6 +334,7 @@ class Log(@volatile var dir: File,
    * @return the updated high watermark offset
    */
   def updateHighWatermark(hw: Long): Long = {
+//    新高水位值一定介于[Log Start Offset，Log End Offset]之间
     val newHighWatermark = if (hw < logStartOffset)
       logStartOffset
     else if (hw > logEndOffset)
@@ -359,9 +364,12 @@ class Log(@volatile var dir: File,
 
       // Ensure that the high watermark increases monotonically. We also update the high watermark when the new
       // offset metadata is on a newer segment, which occurs whenever the log is rolled to a new segment.
+      // 新高水位值要比老高水位值大以维持单调增加特性，否则就不做更新!
+      // 另外，如果新高水位值在新日志段上，也可执行更新高水位操作
       if (oldHighWatermark.messageOffset < newHighWatermark.messageOffset ||
         (oldHighWatermark.messageOffset == newHighWatermark.messageOffset && oldHighWatermark.onOlderSegment(newHighWatermark))) {
         updateHighWatermarkMetadata(newHighWatermark)
+        // 返回老的高水位值
         Some(oldHighWatermark)
       } else {
         None
@@ -374,9 +382,12 @@ class Log(@volatile var dir: File,
    * known, this will do a lookup in the index and cache the result.
    */
   private def fetchHighWatermarkMetadata: LogOffsetMetadata = {
+//     读取时确保日志不能被关闭
     checkIfMemoryMappedBufferClosed()
 
+//    保存当前高水位值到本地变量，避免多线程干扰
     val offsetMetadata = highWatermarkMetadata
+    //没有获得到完整的高水位元数据
     if (offsetMetadata.messageOffsetOnly) {
       lock.synchronized {
         val fullOffset = convertToOffsetMetadataOrThrow(highWatermark)
@@ -388,10 +399,12 @@ class Log(@volatile var dir: File,
     }
   }
 
+//  设置高水位值
   private def updateHighWatermarkMetadata(newHighWatermark: LogOffsetMetadata): Unit = {
     if (newHighWatermark.messageOffset < 0)
       throw new IllegalArgumentException("High watermark offset should be non-negative")
 
+//    保护Log对象修改的Monitor锁
     lock synchronized {
       highWatermarkMetadata = newHighWatermark
       producerStateManager.onHighWatermarkUpdated(newHighWatermark.messageOffset)
@@ -539,6 +552,7 @@ class Log(@volatile var dir: File,
     def deleteIndicesIfExist(baseFile: File, suffix: String = ""): Unit = {
       info(s"Deleting index files with suffix $suffix for baseFile $baseFile")
       val offset = offsetFromFile(baseFile)
+//      删除日志文件对应的索引文件
       Files.deleteIfExists(Log.offsetIndexFile(dir, offset, suffix).toPath)
       Files.deleteIfExists(Log.timeIndexFile(dir, offset, suffix).toPath)
       Files.deleteIfExists(Log.transactionIndexFile(dir, offset, suffix).toPath)
@@ -548,6 +562,7 @@ class Log(@volatile var dir: File,
     var cleanFiles = Set[File]()
     var minCleanedFileOffset = Long.MaxValue
 
+//    遍历分区日志路径下的所有文件
     for (file <- dir.listFiles if file.isFile) {
       if (!file.canRead)
         throw new IOException(s"Could not read file $file")
@@ -558,16 +573,20 @@ class Log(@volatile var dir: File,
       } else if (filename.endsWith(CleanedFileSuffix)) {
         minCleanedFileOffset = Math.min(offsetFromFileName(filename), minCleanedFileOffset)
         cleanFiles += file
+//        以.swap结尾
       } else if (filename.endsWith(SwapFileSuffix)) {
         // we crashed in the middle of a swap operation, to recover:
         // if a log, delete the index files, complete the swap operation later
         // if an index just delete the index files, they will be rebuilt
         val baseFile = new File(CoreUtils.replaceSuffix(file.getPath, SwapFileSuffix, ""))
         info(s"Found file ${file.getAbsolutePath} from interrupted swap operation.")
+//          .swap文件原来是索引文件
         if (isIndexFile(baseFile)) {
           deleteIndicesIfExist(baseFile)
+//          如果该.swap文件原来是日志文件
         } else if (isLogFile(baseFile)) {
           deleteIndicesIfExist(baseFile)
+//          加入待恢复的.swap文件集合中
           swapFiles += file
         }
       }
@@ -576,6 +595,7 @@ class Log(@volatile var dir: File,
     // KAFKA-6264: Delete all .swap files whose base offset is greater than the minimum .cleaned segment offset. Such .swap
     // files could be part of an incomplete split operation that could not complete. See Log#splitOverflowedSegment
     // for more details about the split operation.
+//     从待恢复swap集合中找出那些起始位移值大于minCleanedFileOffset值的文件，直接删掉
     val (invalidSwapFiles, validSwapFiles) = swapFiles.partition(file => offsetFromFile(file) >= minCleanedFileOffset)
     invalidSwapFiles.foreach { file =>
       debug(s"Deleting invalid swap file ${file.getAbsoluteFile} minCleanedFileOffset: $minCleanedFileOffset")
@@ -589,7 +609,7 @@ class Log(@volatile var dir: File,
       debug(s"Deleting stray .clean file ${file.getAbsolutePath}")
       Files.deleteIfExists(file.toPath)
     }
-
+    // 最后返回当前有效的.swap文件集合
     validSwapFiles
   }
 
@@ -603,19 +623,23 @@ class Log(@volatile var dir: File,
   private def loadSegmentFiles(): Unit = {
     // load segments in ascending order because transactional data from one segment may depend on the
     // segments that come before it
+//    按照日志段文件名中的位移值正序排列，然后遍历每个文件
     for (file <- dir.listFiles.sortBy(_.getName) if file.isFile) {
       if (isIndexFile(file)) {
         // if it is an index file, make sure it has a corresponding .log file
         val offset = offsetFromFile(file)
         val logFile = Log.logFile(dir, offset)
+//        确保存在对应的日志文件，否则记录一个警告，并删除该索引文件
         if (!logFile.exists) {
           warn(s"Found an orphaned index file ${file.getAbsolutePath}, with no corresponding log file.")
           Files.deleteIfExists(file.toPath)
         }
+//        如果是日志文件
       } else if (isLogFile(file)) {
         // if it's a log file, load the corresponding log segment
         val baseOffset = offsetFromFile(file)
         val timeIndexFileNewlyCreated = !Log.timeIndexFile(dir, baseOffset).exists()
+//        创建对应的LogSegment对象实例，并加入segments中
         val segment = LogSegment.open(dir = dir,
           baseOffset = baseOffset,
           config,
@@ -669,13 +693,16 @@ class Log(@volatile var dir: File,
   private def completeSwapOperations(swapFiles: Set[File]): Unit = {
     for (swapFile <- swapFiles) {
       val logFile = new File(CoreUtils.replaceSuffix(swapFile.getPath, SwapFileSuffix, ""))
+//      拿到日志文件的起始位移值
       val baseOffset = offsetFromFile(logFile)
+//      创建对应的LogSegment实例
       val swapSegment = LogSegment.open(swapFile.getParentFile,
         baseOffset = baseOffset,
         config,
         time = time,
         fileSuffix = SwapFileSuffix)
       info(s"Found log file ${swapFile.getPath} from interrupted swap operation, repairing.")
+//      执行日志段恢复操作
       recoverSegment(swapSegment)
 
       // We create swap files for two cases:
@@ -686,9 +713,11 @@ class Log(@volatile var dir: File,
       // must fall within the range of existing segment(s). If we cannot find such a segment, it means the deletion
       // of that segment was successful. In such an event, we should simply rename the .swap to .log without having to
       // do a replace with an existing segment.
+//       确认之前删除日志段是否成功，是否还存在老的日志段文件
       val oldSegments = logSegments(swapSegment.baseOffset, swapSegment.readNextOffset).filter { segment =>
         segment.readNextOffset > swapSegment.baseOffset
       }
+//      如果存在，直接把.swap文件重命名成.log
       replaceSegments(Seq(swapSegment), oldSegments.toSeq, isRecoveredSwapFile = true)
     }
   }
@@ -703,6 +732,7 @@ class Log(@volatile var dir: File,
   private def loadSegments(): Long = {
     // first do a pass through the files in the log directory and remove any temporary files
     // and find any interrupted swap operations
+//    移除上次 Failure 遗留下来的各种临时文件(包括.cleaned、.swap、.deleted 文件等)
     val swapFiles = removeTempFilesAndCollectSwapFiles()
 
     // Now do a second pass and load all the log and index files.
@@ -714,16 +744,19 @@ class Log(@volatile var dir: File,
       // call to loadSegmentFiles().
       logSegments.foreach(_.close())
       segments.clear()
+//      重新加载日志段文件
       loadSegmentFiles()
     }
 
     // Finally, complete any interrupted swap operations. To be crash-safe,
     // log files that are replaced by the swap segment should be renamed to .deleted
     // before the swap file is restored as the new segment file.
+//    处理第一步返回的有效.swap 文件集合
     completeSwapOperations(swapFiles)
 
     if (!dir.getAbsolutePath.endsWith(Log.DeleteDirSuffix)) {
       val nextOffset = retryOnOffsetOverflow {
+//        恢复日志 段对象
         recoverLog()
       }
 
@@ -749,6 +782,7 @@ class Log(@volatile var dir: File,
 
     // Update the high watermark in case it has gotten ahead of the log end offset following a truncation
     // or if a new segment has been rolled and the offset metadata needs to be updated.
+//    更新过程中发现新 LEO 值小于高水位值，那么 Kafka 还要更新高水位值，因 为对于同一个 Log 对象而言，高水位值是不能越过 LEO 值的
     if (highWatermark >= offset) {
       updateHighWatermarkMetadata(nextOffsetMetadata)
     }
@@ -778,6 +812,7 @@ class Log(@volatile var dir: File,
    */
   private def recoverLog(): Long = {
     // if we have the clean shutdown marker, skip recovery
+//    如果不存在以.kafka_cleanshutdown结尾的文件。通常都不存在
     if (!hasCleanShutdownFile) {
       // okay we need to actually recover this log
       val unflushed = logSegments(this.recoveryPoint, Long.MaxValue).toIterator
@@ -814,8 +849,10 @@ class Log(@volatile var dir: File,
       }
     }
 
+//    这些都做完之后，如果日志段集合为空了
     if (logSegments.isEmpty) {
       // no existing segments, create a new mutable segment beginning at logStartOffset
+//      至少创建一个新的日志段，以logStartOffset为日志段的起始位移，并加入日志段集合中
       addSegment(LogSegment.open(dir = dir,
         baseOffset = logStartOffset,
         config,
@@ -1059,20 +1096,26 @@ class Log(@volatile var dir: File,
                      assignOffsets: Boolean,
                      leaderEpoch: Int): LogAppendInfo = {
     maybeHandleIOException(s"Error while appending records to $topicPartition in dir ${dir.getParent}") {
+      // 第1步:分析和验证待写入消息集合，并返回校验结果
+//      针对不同的消息格式版本，Kafka 是如何做校验
       val appendInfo = analyzeAndValidateRecords(records, origin)
 
       // return if we have no valid messages or if this is a duplicate of the last appended entry
+      // 如果压根就不需要写入任何消息，直接返回即可
       if (appendInfo.shallowCount == 0)
         return appendInfo
 
       // trim any invalid bytes or partial messages before appending it to the on-disk log
+      // 第2步:消息格式规整，即删除无效格式消息或无效字节
       var validRecords = trimInvalidBytes(records, appendInfo)
 
       // they are valid, insert them in the log
       lock synchronized {
         checkIfMemoryMappedBufferClosed()
+        // 需要分配位移
         if (assignOffsets) {
           // assign offsets to the message set
+          // 第3步:使用当前LEO值作为待写入消息集合中第一条消息的位移值
           val offset = new LongRef(nextOffsetMetadata.messageOffset)
           appendInfo.firstOffset = Some(offset.value)
           val now = time.milliseconds
@@ -1096,6 +1139,7 @@ class Log(@volatile var dir: File,
             case e: IOException =>
               throw new KafkaException(s"Error validating messages while appending to log $name", e)
           }
+          // 更新校验结果对象类LogAppendInfo
           validRecords = validateAndOffsetAssignResult.validatedRecords
           appendInfo.maxTimestamp = validateAndOffsetAssignResult.maxTimestamp
           appendInfo.offsetOfMaxTimestamp = validateAndOffsetAssignResult.shallowOffsetOfMaxTimestamp
@@ -1106,6 +1150,7 @@ class Log(@volatile var dir: File,
 
           // re-validate message sizes if there's a possibility that they have changed (due to re-compression or message
           // format conversion)
+          // 第4步:验证消息，确保消息大小不超限
           if (validateAndOffsetAssignResult.messageSizeMaybeChanged) {
             for (batch <- validRecords.batches.asScala) {
               if (batch.sizeInBytes > config.maxMessageSize) {
@@ -1118,8 +1163,10 @@ class Log(@volatile var dir: File,
               }
             }
           }
+          // 直接使用给定的位移值，无需自己分配位移值
         } else {
           // we are taking the offsets we are given
+          // 确保消息位移值的单调递增性
           if (!appendInfo.offsetsMonotonic)
             throw new OffsetsOutOfOrderException(s"Out of order offsets found in append to $topicPartition: " +
                                                  records.records.asScala.map(_.offset))
@@ -1144,6 +1191,7 @@ class Log(@volatile var dir: File,
         }
 
         // update the epoch cache with the epoch stamped onto the message by the leader
+        // 第5步:更新Leader Epoch缓存
         validRecords.batches.asScala.foreach { batch =>
           if (batch.magic >= RecordBatch.MAGIC_VALUE_V2) {
             maybeAssignEpochStartOffset(batch.partitionLeaderEpoch, batch.baseOffset)
@@ -1159,12 +1207,14 @@ class Log(@volatile var dir: File,
         }
 
         // check messages set size may be exceed config.segmentSize
+        // 第6步:确保消息大小不超限
         if (validRecords.sizeInBytes > config.segmentSize) {
           throw new RecordBatchTooLargeException(s"Message batch size is ${validRecords.sizeInBytes} bytes in append " +
             s"to partition $topicPartition, which exceeds the maximum configured segment size of ${config.segmentSize}.")
         }
 
         // maybe roll the log if this segment is full
+        // 第7步:执行日志切分。当前日志段剩余容量可能无法容纳新消息集合，因此有必要创建一个新的
         val segment = maybeRoll(validRecords.sizeInBytes, appendInfo)
 
         val logOffsetMetadata = LogOffsetMetadata(
@@ -1174,6 +1224,7 @@ class Log(@volatile var dir: File,
 
         // now that we have valid records, offsets assigned, and timestamps updated, we need to
         // validate the idempotent/transactional state of the producers and collect some metadata
+        // 第8步:验证事务状态
         val (updatedProducers, completedTxns, maybeDuplicate) = analyzeAndValidateProducerState(
           logOffsetMetadata, validRecords, origin)
 
@@ -1185,6 +1236,7 @@ class Log(@volatile var dir: File,
           return appendInfo
         }
 
+        // 第9步:执行真正的消息写入操作，主要调用日志段对象的append方法实现
         segment.append(largestOffset = appendInfo.lastOffset,
           largestTimestamp = appendInfo.maxTimestamp,
           shallowOffsetOfMaxTimestamp = appendInfo.offsetOfMaxTimestamp,
@@ -1196,9 +1248,12 @@ class Log(@volatile var dir: File,
         // will be cleaned up after the log directory is recovered. Note that the end offset of the
         // ProducerStateManager will not be updated and the last stable offset will not advance
         // if the append to the transaction index fails.
+        // 第10步:更新LEO对象，其中，LEO值是消息集合中最后一条消息位移值+1
+        // 前面说过，LEO值永远指向下一条不存在的消息
         updateLogEndOffset(appendInfo.lastOffset + 1)
 
         // update the producer state
+        // 第11步:更新事务状态
         for (producerAppendInfo <- updatedProducers.values) {
           producerStateManager.update(producerAppendInfo)
         }
@@ -1223,9 +1278,11 @@ class Log(@volatile var dir: File,
           s"next offset: ${nextOffsetMetadata.messageOffset}, " +
           s"and messages: $validRecords")
 
+        // 是否需要手动落盘。一般情况下我们不需要设置Broker端参数log.flush.interval.message
+        // 落盘操作交由操作系统来完成。但某些情况下，可以设置该参数来确保高可靠性
         if (unflushedMessages >= config.flushInterval)
           flush()
-
+        // 第12步:返回写入结果
         appendInfo
       }
     }
@@ -1358,6 +1415,7 @@ class Log(@volatile var dir: File,
 
     for (batch <- records.batches.asScala) {
       // we only validate V2 and higher to avoid potential compatibility issues with older clients
+      // 消息格式Version 2的消息批次，起始位移值必须从0开始
       if (batch.magic >= RecordBatch.MAGIC_VALUE_V2 && origin == AppendOrigin.Client && batch.baseOffset != 0)
         throw new InvalidRecordException(s"The baseOffset of the record batch in the append to $topicPartition should " +
           s"be 0, but it is ${batch.baseOffset}")
@@ -1376,13 +1434,17 @@ class Log(@volatile var dir: File,
       }
 
       // check that offsets are monotonically increasing
+      // 一旦出现当前lastOffset不小于下一个batch的lastOffset，说明上一个batch中有消息的
+      // 这违反了位移值单调递增性
       if (lastOffset >= batch.lastOffset)
         monotonic = false
 
       // update the last offset seen
+      // 使用当前batch最后一条消息的位移值去更新lastOffset
       lastOffset = batch.lastOffset
 
       // Check if the message sizes are valid.
+      // 检查消息批次总字节数大小是否超限，即是否大于Broker端参数max.message.bytes值
       val batchSize = batch.sizeInBytes
       if (batchSize > config.maxMessageSize) {
         brokerTopicStats.topicStats(topicPartition.topic).bytesRejectedRate.mark(records.sizeInBytes)
@@ -1392,26 +1454,33 @@ class Log(@volatile var dir: File,
       }
 
       // check the validity of the message by checking CRC
+      // 执行消息批次校验，包括格式是否正确以及CRC校验
       if (!batch.isValid) {
         brokerTopicStats.allTopicsStats.invalidMessageCrcRecordsPerSec.mark()
         throw new CorruptRecordException(s"Record is corrupt (stored crc = ${batch.checksum()}) in topic partition $topicPartition.")
       }
 
+      // 更新maxTimestamp字段和offsetOfMaxTimestamp
       if (batch.maxTimestamp > maxTimestamp) {
         maxTimestamp = batch.maxTimestamp
         offsetOfMaxTimestamp = lastOffset
       }
 
+      // 累加消息批次计数器以及有效字节数，更新shallowMessageCount字段
       shallowMessageCount += 1
       validBytesCount += batchSize
 
+      // 从消息批次中获取压缩器类型
       val messageCodec = CompressionCodec.getCompressionCodec(batch.compressionType.id)
       if (messageCodec != NoCompressionCodec)
         sourceCodec = messageCodec
     }
 
     // Apply broker-side compression if any
+    // 获取Broker端设置的压缩器类型，即Broker端参数compression.type值。
+    // 该参数默认值是producer，表示sourceCodec用的什么压缩器，targetCodec就用什么
     val targetCodec = BrokerCompressionCodec.getTargetCompressionCodec(config.compressionType, sourceCodec)
+    // 最后生成LogAppendInfo对象并返回
     LogAppendInfo(firstOffset, lastOffset, maxTimestamp, offsetOfMaxTimestamp, RecordBatch.NO_TIMESTAMP, logStartOffset,
       RecordConversionStats.EMPTY, sourceCodec, targetCodec, shallowMessageCount, validBytesCount, monotonic, lastOffsetOfFirstBatch)
   }
@@ -1479,23 +1548,34 @@ class Log(@volatile var dir: File,
 
       // Because we don't use the lock for reading, the synchronization is a little bit tricky.
       // We create the local variables to avoid race conditions with updates to the log.
+      // 读取消息时没有使用Monitor锁同步机制，因此这里取巧了，用本地变量的方式把LEO对象保存
       val endOffsetMetadata = nextOffsetMetadata
       val endOffset = endOffsetMetadata.messageOffset
+      // 找到startOffset值所在的日志段对象。注意要使用floorEntry方法
       var segmentEntry = segments.floorEntry(startOffset)
 
       // return error on attempt to read beyond the log end offset or read below log start offset
+      // 满足以下条件之一将被视为消息越界，即你要读取的消息不在该Log对象中:
+      // 1. 要读取的消息位移超过了LEO值
+      // 2. 没找到对应的日志段对象
+      // 3. 要读取的消息在Log Start Offset之下，同样是对外不可见的消息
       if (startOffset > endOffset || segmentEntry == null || startOffset < logStartOffset)
         throw new OffsetOutOfRangeException(s"Received request for offset $startOffset for partition $topicPartition, " +
           s"but we only have log segments in the range $logStartOffset to $endOffset.")
 
+      // 查看一下读取隔离级别设置。
+      // 普通消费者能够看到[Log Start Offset, LEO)之间的消息
+      // 事务型消费者只能看到[Log Start Offset, Log Stable Offset]之间的消息。
+      // Follower副本消费者能够看到[Log Start Offset，高水位值]之间的消息
       val maxOffsetMetadata = isolation match {
         case FetchLogEnd => endOffsetMetadata
         case FetchHighWatermark => fetchHighWatermarkMetadata
         case FetchTxnCommitted => fetchLastStableOffsetMetadata
       }
-
+      // 如果从LEO处开始读取，那么自然不会返回任何数据，
       if (startOffset == maxOffsetMetadata.messageOffset) {
         return emptyFetchDataInfo(maxOffsetMetadata, includeAbortedTxns)
+      // 如果要读取的起始位置超过了能读取的最大位置，返回空的消息集合，因为没法读取任何消息
       } else if (startOffset > maxOffsetMetadata.messageOffset) {
         val startOffsetMetadata = convertToOffsetMetadataOrThrow(startOffset)
         return emptyFetchDataInfo(startOffsetMetadata, includeAbortedTxns)
@@ -1504,6 +1584,7 @@ class Log(@volatile var dir: File,
       // Do the read on the segment with a base offset less than the target offset
       // but if that segment doesn't contain any messages with an offset greater than that
       // continue to read from successive segments until we get some messages or we reach the end of the log
+      // 开始遍历日志段对象，直到读出东西来或者读到日志末尾
       while (segmentEntry != null) {
         val segment = segmentEntry.getValue
 
@@ -1516,7 +1597,9 @@ class Log(@volatile var dir: File,
           }
         }
 
-        val fetchInfo = segment.read(startOffset, maxLength, maxPosition, minOneMessage)
+        // 调用日志段对象的read方法执行真正的读取消息操作
+        val fetchInfo = segment.read(startOffset, maxLength, maxPosition, minOneMessage
+        // 如果没有返回任何消息，去下一个日志段对象试试
         if (fetchInfo == null) {
           segmentEntry = segments.higherEntry(segmentEntry.getKey)
         } else {
@@ -1530,6 +1613,7 @@ class Log(@volatile var dir: File,
       // okay we are beyond the end of the last segment with no data fetched although the start offset is in range,
       // this can happen when all messages with offset larger than start offsets have been deleted.
       // In this case, we will return the empty set with log end offset metadata
+      // 已经读到日志末尾还是没有数据返回，只能返回空消息集合
       FetchDataInfo(nextOffsetMetadata, MemoryRecords.EMPTY)
     }
   }
@@ -1716,12 +1800,15 @@ class Log(@volatile var dir: File,
       val numToDelete = deletable.size
       if (numToDelete > 0) {
         // we must always have at least one segment, so if we are going to delete all the segments, create a new one first
+        // 不允许删除所有日志段对象。如果一定要做，先创建出一个新的来，然后再把前面N个删掉
         if (segments.size == numToDelete)
           roll()
         lock synchronized {
           checkIfMemoryMappedBufferClosed()
           // remove the segments for lookups
+          // 删除给定的日志段对象以及底层的物理文件
           removeAndDeleteSegments(deletable, asyncDelete = true)
+          // 尝试更新日志的Log Start Offset值
           maybeIncrementLogStartOffset(segments.firstEntry.getValue.baseOffset)
         }
       }
@@ -1747,6 +1834,12 @@ class Log(@volatile var dir: File,
     } else {
       val deletable = ArrayBuffer.empty[LogSegment]
       var segmentEntry = segments.firstEntry
+      // 从具有最小起始位移值的日志段对象开始遍历，直到满足以下条件之一便停止遍历:
+      // 1. 测定条件函数predicate = false
+      // 2. 扫描到包含Log对象高水位值所在的日志段对象
+      // 3. 最新的日志段对象不包含任何消息
+      // 最新日志段对象是segments中Key值最大对应的那个日志段，也就是我们常说的Active Segment
+      // 在遍历过程中，同时不满足以上3个条件的所有日志段都是可以被删除的!
       while (segmentEntry != null) {
         val segment = segmentEntry.getValue
         val nextSegmentEntry = segments.higherEntry(segmentEntry.getKey)
