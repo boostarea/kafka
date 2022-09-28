@@ -17,12 +17,12 @@
 
 package kafka.log
 
-import java.io.File
-import java.nio.ByteBuffer
-
 import kafka.utils.CoreUtils.inLock
 import kafka.utils.Logging
 import org.apache.kafka.common.errors.InvalidOffsetException
+
+import java.io.File
+import java.nio.ByteBuffer
 
 /**
  * An index that maps offsets to physical file locations for a particular log segment. This index may be sparse:
@@ -116,6 +116,7 @@ class OffsetIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writabl
 
   private def physical(buffer: ByteBuffer, n: Int): Int = buffer.getInt(n * entrySize + 4)
 
+//  查找给定的索引项
   override protected def parseEntry(buffer: ByteBuffer, n: Int): OffsetPosition = {
     OffsetPosition(baseOffset + relativeOffset(buffer, n), physical(buffer, n))
   }

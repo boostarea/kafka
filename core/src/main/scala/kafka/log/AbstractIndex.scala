@@ -17,18 +17,17 @@
 
 package kafka.log
 
-import java.io.{Closeable, File, RandomAccessFile}
-import java.nio.channels.FileChannel
-import java.nio.file.Files
-import java.nio.{ByteBuffer, MappedByteBuffer}
-import java.util.concurrent.locks.{Lock, ReentrantLock}
-
 import kafka.common.IndexOffsetOverflowException
 import kafka.log.IndexSearchType.IndexSearchEntity
 import kafka.utils.CoreUtils.inLock
 import kafka.utils.{CoreUtils, Logging}
 import org.apache.kafka.common.utils.{MappedByteBuffers, OperatingSystem, Utils}
 
+import java.io.{Closeable, File, RandomAccessFile}
+import java.nio.channels.FileChannel
+import java.nio.file.Files
+import java.nio.{ByteBuffer, MappedByteBuffer}
+import java.util.concurrent.locks.{Lock, ReentrantLock}
 import scala.math.ceil
 
 /**
@@ -38,6 +37,8 @@ import scala.math.ceil
  * @param baseOffset the base offset of the segment that this index is corresponding to.
  * @param maxIndexSize The maximum index size in bytes.
  */
+//file var 型，说明它是可以被修改的，自 1.1.0 版本之后，Kafka 允许迁移底层的日志路径
+//segment.index.bytes，默认情 况下，所有 Kafka 索引文件大小都是 10MB 的原因。
 abstract class AbstractIndex(@volatile var file: File, val baseOffset: Long, val maxIndexSize: Int = -1,
                              val writable: Boolean) extends Closeable {
   import AbstractIndex._
@@ -108,6 +109,7 @@ abstract class AbstractIndex(@volatile var file: File, val baseOffset: Long, val
 
   protected val lock = new ReentrantLock
 
+//  AbstractIndex 其他大部分的操作 都是和 mmap 相关
   @volatile
   protected var mmap: MappedByteBuffer = {
     val newlyCreated = file.createNewFile()
@@ -367,6 +369,7 @@ abstract class AbstractIndex(@volatile var file: File, val baseOffset: Long, val
   /**
    * Lookup lower and upper bounds for the given target.
    */
+//  缓存友好的二分查找
   private def indexSlotRangeFor(idx: ByteBuffer, target: Long, searchEntity: IndexSearchEntity): (Int, Int) = {
     // check if the index is empty
     if(_entries == 0)
@@ -390,6 +393,9 @@ abstract class AbstractIndex(@volatile var file: File, val baseOffset: Long, val
       (lo, if (lo == _entries - 1) -1 else lo + 1)
     }
 
+//  确定冷热分隔线
+  // 如果是OffsetIndex，_warmEntries = 8192 / 8 = 1024，即第1024个槽
+  // 如果是TimeIndex，_warmEntries = 8192 / 12 = 682，即第682个槽
     val firstHotEntry = Math.max(0, _entries - 1 - _warmEntries)
     // check if the target offset is in the warm section of the index
     if(compareIndexEntry(parseEntry(idx, firstHotEntry), target, searchEntity) < 0) {
